@@ -1993,6 +1993,114 @@ INSERT INTO stats_user_daily (
 }
 
 #[tokio::test]
+async fn sqlite_dashboard_summary_merges_raw_tail_beyond_aggregates() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+
+    // Aggregated day: 1970-01-01 with 9 requests and 2 provider transfers.
+    sqlx::query(
+        r#"
+INSERT INTO stats_daily (
+    id, "date", total_requests, success_requests, error_requests,
+    input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+    total_cost, actual_total_cost, fallback_count, is_complete, created_at, updated_at
+) VALUES (
+    'daily-1', 0, 9, 8, 1, 10, 20, 3, 4, 1.25, 1.0, 2, 1, 1, 1
+);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("daily aggregates should seed");
+
+    sqlx::query(
+        r#"
+INSERT INTO stats_daily_model_provider (
+    id, "date", model, provider_name, total_requests, total_tokens, total_cost,
+    response_time_sum_ms, response_time_samples, created_at, updated_at
+) VALUES
+    ('daily-mp-1', 0, 'gpt-4o', 'openai', 6, 25, 0.9, 1200.0, 6, 1, 1),
+    ('daily-mp-2', 0, 'claude-3-5-sonnet', 'anthropic', 3, 12, 0.35, 900.0, 3, 1, 1);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("daily model provider aggregates should seed");
+
+    // Today (1970-01-02 01:00) is not aggregated yet: one raw request whose
+    // scheduling produced two candidates (a provider transfer). The usage
+    // pipeline stores second-granular timestamps in created_at_unix_ms, while
+    // request_candidates.created_at is true milliseconds.
+    let writer = SqliteUsageWriteRepository::new(pool.clone());
+    let mut today_usage = sample_usage("today-request", "completed", "settled", 90_000);
+    today_usage.response_time_ms = Some(500);
+    writer
+        .upsert(today_usage)
+        .await
+        .expect("today usage should seed");
+
+    for candidate_index in 0..2 {
+        sqlx::query(
+            r#"
+INSERT INTO request_candidates (
+    id, request_id, candidate_index, retry_index, status, created_at
+) VALUES (?, 'today-request', ?, 0, 'success', 90000000);
+"#,
+        )
+        .bind(format!("candidate-{candidate_index}"))
+        .bind(candidate_index)
+        .execute(&pool)
+        .await
+        .expect("request candidates should seed");
+    }
+
+    let reader = SqliteUsageReadRepository::new(pool);
+    let summary = reader
+        .summarize_dashboard_usage(&UsageDashboardSummaryQuery {
+            created_from_unix_secs: 0,
+            created_until_unix_secs: 172_800,
+            user_id: None,
+        })
+        .await
+        .expect("dashboard summary should load");
+    assert_eq!(summary.total_requests, 10);
+    assert_eq!(summary.response_time_sum_ms, 2600.0);
+    assert_eq!(summary.response_time_samples, 10);
+    assert_eq!(summary.fallback_count, 3);
+
+    let rows = reader
+        .list_dashboard_daily_breakdown(&UsageDashboardDailyBreakdownQuery {
+            created_from_unix_secs: 0,
+            created_until_unix_secs: 172_800,
+            tz_offset_minutes: 0,
+            user_id: None,
+        })
+        .await
+        .expect("dashboard daily breakdown should load");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].date, "1970-01-01");
+    assert_eq!(rows[0].model, "gpt-4o");
+    assert_eq!(rows[0].response_time_sum_ms, 1200.0);
+    assert_eq!(rows[1].date, "1970-01-01");
+    assert_eq!(rows[1].model, "claude-3-5-sonnet");
+    let today_row = rows
+        .iter()
+        .find(|row| row.date == "1970-01-02")
+        .expect("today row should be answered from raw usage");
+    assert_eq!(today_row.requests, 1);
+    assert_eq!(today_row.model, "model-1");
+    assert_eq!(today_row.provider, "Provider One");
+    assert_eq!(today_row.response_time_sum_ms, 500.0);
+    assert_eq!(today_row.response_time_samples, 1);
+}
+
+#[tokio::test]
 async fn sqlite_first_byte_fast_path_preserves_lifecycle_state_and_counters() {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)

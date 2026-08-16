@@ -1153,12 +1153,56 @@ pub struct StoredUsageDashboardSummary {
     pub error_requests: u64,
     pub response_time_sum_ms: f64,
     pub response_time_samples: u64,
+    pub fallback_count: u64,
+}
+
+impl StoredUsageDashboardSummary {
+    /// Merge another window's totals into this summary (saturating on integers).
+    pub fn absorb(&mut self, other: &Self) {
+        self.total_requests = self.total_requests.saturating_add(other.total_requests);
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.effective_input_tokens = self
+            .effective_input_tokens
+            .saturating_add(other.effective_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+        self.cache_creation_tokens = self
+            .cache_creation_tokens
+            .saturating_add(other.cache_creation_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.total_input_context = self
+            .total_input_context
+            .saturating_add(other.total_input_context);
+        self.cache_creation_cost_usd += other.cache_creation_cost_usd;
+        self.cache_read_cost_usd += other.cache_read_cost_usd;
+        self.total_cost_usd += other.total_cost_usd;
+        self.actual_total_cost_usd += other.actual_total_cost_usd;
+        self.error_requests = self.error_requests.saturating_add(other.error_requests);
+        self.response_time_sum_ms += other.response_time_sum_ms;
+        self.response_time_samples = self
+            .response_time_samples
+            .saturating_add(other.response_time_samples);
+        self.fallback_count = self.fallback_count.saturating_add(other.fallback_count);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct StoredUsageDashboardStatsSummary {
     pub usage: StoredUsageDashboardSummary,
     pub cost_savings: StoredUsageCostSavingsSummary,
+}
+
+/// Dashboard summary answered from pre-aggregated daily stats tables, plus the
+/// UTC-second window those aggregates actually cover. The daily aggregation
+/// job only writes complete UTC days (up to yesterday), so callers must merge
+/// raw usage for any uncovered head/tail of the requested range.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct StoredUsageDashboardAggregateSummary {
+    pub summary: StoredUsageDashboardSummary,
+    pub covered_from_unix_secs: u64,
+    pub covered_until_unix_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

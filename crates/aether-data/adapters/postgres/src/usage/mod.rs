@@ -355,6 +355,10 @@ fn decode_dashboard_summary_row(
             .try_get::<i64, _>("response_time_samples")
             .map_postgres_err()?
             .max(0) as u64,
+        fallback_count: row
+            .try_get::<i64, _>("fallback_count")
+            .map_postgres_err()?
+            .max(0) as u64,
     })
 }
 
@@ -2592,7 +2596,24 @@ SELECT
     COALESCE(CAST("usage".input_price_per_1m AS DOUBLE PRECISION), 0)
       * GREATEST(COALESCE("usage".cache_read_input_tokens, 0), 0)::DOUBLE PRECISION
       / 1000000.0
-  ), 0) AS savings_estimated_full_cost_usd
+  ), 0) AS savings_estimated_full_cost_usd,
+"#,
+        );
+        // A request whose scheduling produced multiple settled candidates was
+        // transferred to another provider (fallback).
+        builder.push("  (SELECT COUNT(*) FROM (SELECT rc.request_id FROM request_candidates rc WHERE rc.created_at >= TO_TIMESTAMP(");
+        builder.push_bind(created_from_unix_secs as f64);
+        builder.push("::double precision) AND rc.created_at < TO_TIMESTAMP(");
+        builder.push_bind(created_until_unix_secs as f64);
+        builder.push("::double precision) AND rc.status = ANY(");
+        builder.push_bind(vec!["success".to_string(), "failed".to_string()]);
+        builder.push(")");
+        if let Some(user_id) = user_id {
+            builder.push(" AND rc.user_id = ");
+            builder.push_bind(user_id.to_string());
+        }
+        builder.push(
+            r#" GROUP BY rc.request_id HAVING COUNT(rc.id) > 1) AS fallback_requests)::BIGINT AS fallback_count
 FROM (
   SELECT
     "range_usage".*,

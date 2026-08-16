@@ -200,11 +200,44 @@ impl UsageReadRepository for MysqlUsageReadRepository {
         if query.created_from_unix_secs >= query.created_until_unix_secs {
             return Ok(StoredUsageDashboardSummary::default());
         }
-        if let Some(summary) = self
+        if let Some(aggregate) = self
             .storage
             .summarize_dashboard_usage_from_daily_aggregates(query)
             .await?
         {
+            let mut summary = aggregate.summary;
+            // Daily aggregates only cover complete UTC days; answer the
+            // uncovered head/tail of the window from the raw usage table.
+            if aggregate.covered_from_unix_secs > query.created_from_unix_secs {
+                let head_query = UsageDashboardSummaryQuery {
+                    created_from_unix_secs: query.created_from_unix_secs,
+                    created_until_unix_secs: aggregate.covered_from_unix_secs,
+                    user_id: query.user_id.clone(),
+                };
+                let filter = Self::range(
+                    head_query.created_from_unix_secs,
+                    head_query.created_until_unix_secs,
+                )
+                .with_user_id(head_query.user_id.as_deref())
+                .finalized_only();
+                let repository = self.materialize_read_model(filter).await?;
+                summary.absorb(&repository.summarize_dashboard_usage(&head_query).await?);
+            }
+            if aggregate.covered_until_unix_secs < query.created_until_unix_secs {
+                let tail_query = UsageDashboardSummaryQuery {
+                    created_from_unix_secs: aggregate.covered_until_unix_secs,
+                    created_until_unix_secs: query.created_until_unix_secs,
+                    user_id: query.user_id.clone(),
+                };
+                let filter = Self::range(
+                    tail_query.created_from_unix_secs,
+                    tail_query.created_until_unix_secs,
+                )
+                .with_user_id(tail_query.user_id.as_deref())
+                .finalized_only();
+                let repository = self.materialize_read_model(filter).await?;
+                summary.absorb(&repository.summarize_dashboard_usage(&tail_query).await?);
+            }
             return Ok(summary);
         }
         let filter = Self::range(query.created_from_unix_secs, query.created_until_unix_secs)
@@ -226,6 +259,41 @@ impl UsageReadRepository for MysqlUsageReadRepository {
             .list_dashboard_daily_breakdown_from_daily_aggregates(query)
             .await?;
         if !rows.is_empty() {
+            // Aggregate rows cover complete UTC days only; answer the trailing
+            // part of the window (today) from raw usage, grouped by UTC days
+            // (tz offset 0) to match the aggregate row day semantics.
+            let covered_until_secs = rows
+                .iter()
+                .filter_map(|row| chrono::NaiveDate::parse_from_str(&row.date, "%Y-%m-%d").ok())
+                .filter_map(|date| date.and_hms_opt(0, 0, 0))
+                .map(|midnight| midnight.and_utc().timestamp())
+                .max()
+                .unwrap_or(0)
+                .saturating_add(86_400)
+                .max(0) as u64;
+            let tail_from = covered_until_secs.max(query.created_from_unix_secs);
+            if tail_from < query.created_until_unix_secs {
+                let tail_query = UsageDashboardDailyBreakdownQuery {
+                    created_from_unix_secs: tail_from,
+                    created_until_unix_secs: query.created_until_unix_secs,
+                    tz_offset_minutes: 0,
+                    user_id: query.user_id.clone(),
+                };
+                let filter = Self::range(
+                    tail_query.created_from_unix_secs,
+                    tail_query.created_until_unix_secs,
+                )
+                .with_user_id(tail_query.user_id.as_deref())
+                .finalized_only();
+                let repository = self.materialize_read_model(filter).await?;
+                let mut merged = rows;
+                merged.extend(
+                    repository
+                        .list_dashboard_daily_breakdown(&tail_query)
+                        .await?,
+                );
+                return Ok(merged);
+            }
             return Ok(rows);
         }
         let filter = Self::range(query.created_from_unix_secs, query.created_until_unix_secs)

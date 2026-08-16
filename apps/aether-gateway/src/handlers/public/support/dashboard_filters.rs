@@ -47,6 +47,7 @@ struct DashboardUsageTotals {
     error_requests: u64,
     response_time_sum_ms: f64,
     response_time_samples: u64,
+    fallback_count: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -106,6 +107,7 @@ impl DashboardUsageTotals {
         self.response_time_samples = self
             .response_time_samples
             .saturating_add(summary.response_time_samples);
+        self.fallback_count = self.fallback_count.saturating_add(summary.fallback_count);
     }
 
     fn avg_response_time_seconds(&self) -> f64 {
@@ -1136,7 +1138,7 @@ pub(super) async fn handle_dashboard_stats_get(
                 "avg_response_time": period_totals.avg_response_time_seconds(),
                 "error_rate": if period_totals.requests == 0 { 0.0 } else { dashboard_round_f64(period_totals.error_requests as f64 / period_totals.requests as f64 * 100.0, 4) },
                 "error_requests": period_totals.error_requests,
-                "fallback_count": 0,
+                "fallback_count": period_totals.fallback_count,
                 "total_requests": period_totals.requests,
             },
             "cost_stats": {

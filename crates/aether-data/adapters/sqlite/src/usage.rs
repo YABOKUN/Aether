@@ -18,8 +18,9 @@ use aether_data_contracts::repository::usage::{
     StoredUsageAuditAggregation, StoredUsageAuditSummary, StoredUsageBreakdownSummaryRow,
     StoredUsageCacheAffinityHitSummary, StoredUsageCacheAffinityIntervalRow,
     StoredUsageCacheHitSummary, StoredUsageCostSavingsSummary, StoredUsageDailySummary,
-    StoredUsageDashboardDailyBreakdownRow, StoredUsageDashboardProviderCount,
-    StoredUsageDashboardSummary, StoredUsageErrorDistributionRow, StoredUsageLeaderboardSummary,
+    StoredUsageDashboardAggregateSummary, StoredUsageDashboardDailyBreakdownRow,
+    StoredUsageDashboardProviderCount, StoredUsageDashboardSummary,
+    StoredUsageErrorDistributionRow, StoredUsageLeaderboardSummary,
     StoredUsagePerformancePercentilesRow, StoredUsageProviderPerformance,
     StoredUsageProviderPerformanceProviderRow, StoredUsageProviderPerformanceSummary,
     StoredUsageProviderPerformanceTimelineRow, StoredUsageSettledCostSummary,
@@ -2176,7 +2177,7 @@ ORDER BY "usage".user_id ASC
     async fn summarize_dashboard_usage_from_daily_aggregates(
         &self,
         query: &UsageDashboardSummaryQuery,
-    ) -> Result<Option<StoredUsageDashboardSummary>, DataLayerError> {
+    ) -> Result<Option<StoredUsageDashboardAggregateSummary>, DataLayerError> {
         let row = if let Some(user_id) = query.user_id.as_deref() {
             sqlx::query(
                 r#"
@@ -2194,8 +2195,8 @@ SELECT
   COALESCE(SUM(COALESCE(CAST(total_cost AS REAL), 0)), 0) AS total_cost_usd,
   COALESCE(SUM(COALESCE(CAST(total_cost AS REAL), 0)), 0) AS actual_total_cost_usd,
   COALESCE(SUM(error_requests), 0) AS error_requests,
-  0.0 AS response_time_sum_ms,
-  0 AS response_time_samples
+  MIN("date") AS covered_from,
+  MAX("date") + 86400 AS covered_until
 FROM stats_user_daily
 WHERE user_id = ?
   AND "date" >= ?
@@ -2225,8 +2226,9 @@ SELECT
   COALESCE(SUM(COALESCE(CAST(total_cost AS REAL), 0)), 0) AS total_cost_usd,
   COALESCE(SUM(COALESCE(CAST(actual_total_cost AS REAL), 0)), 0) AS actual_total_cost_usd,
   COALESCE(SUM(error_requests), 0) AS error_requests,
-  0.0 AS response_time_sum_ms,
-  0 AS response_time_samples
+  COALESCE(SUM(fallback_count), 0) AS fallback_count,
+  MIN("date") AS covered_from,
+  MAX("date") + 86400 AS covered_until
 FROM stats_daily
 WHERE "date" >= ?
   AND "date" < ?
@@ -2244,22 +2246,84 @@ WHERE "date" >= ?
             return Ok(None);
         }
 
-        Ok(Some(StoredUsageDashboardSummary {
-            total_requests,
-            input_tokens: sqlite_aggregate_u64(&row, "input_tokens")?,
-            effective_input_tokens: sqlite_aggregate_u64(&row, "effective_input_tokens")?,
-            output_tokens: sqlite_aggregate_u64(&row, "output_tokens")?,
-            total_tokens: sqlite_aggregate_u64(&row, "total_tokens")?,
-            cache_creation_tokens: sqlite_aggregate_u64(&row, "cache_creation_tokens")?,
-            cache_read_tokens: sqlite_aggregate_u64(&row, "cache_read_tokens")?,
-            total_input_context: sqlite_aggregate_u64(&row, "total_input_context")?,
-            cache_creation_cost_usd: sqlite_real(&row, "cache_creation_cost_usd")?,
-            cache_read_cost_usd: sqlite_real(&row, "cache_read_cost_usd")?,
-            total_cost_usd: sqlite_real(&row, "total_cost_usd")?,
-            actual_total_cost_usd: sqlite_real(&row, "actual_total_cost_usd")?,
-            error_requests: sqlite_aggregate_u64(&row, "error_requests")?,
-            response_time_sum_ms: sqlite_real(&row, "response_time_sum_ms")?,
-            response_time_samples: sqlite_aggregate_u64(&row, "response_time_samples")?,
+        // stats_daily only keeps avg_response_time_ms; the model/provider dimension
+        // tables carry the exact response-time sums the aggregation job maintains.
+        let response_row = if let Some(user_id) = query.user_id.as_deref() {
+            sqlx::query(
+                r#"
+SELECT
+  COALESCE(SUM(response_time_sum_ms), 0) AS response_time_sum_ms,
+  COALESCE(SUM(response_time_samples), 0) AS response_time_samples
+FROM stats_user_daily_model_provider
+WHERE user_id = ?
+  AND "date" >= ?
+  AND "date" < ?
+"#,
+            )
+            .bind(user_id)
+            .bind(query.created_from_unix_secs as i64)
+            .bind(query.created_until_unix_secs as i64)
+            .fetch_one(&self.pool)
+            .await
+            .map_sql_err()?
+        } else {
+            sqlx::query(
+                r#"
+SELECT
+  COALESCE(SUM(response_time_sum_ms), 0) AS response_time_sum_ms,
+  COALESCE(SUM(response_time_samples), 0) AS response_time_samples
+FROM stats_daily_model_provider
+WHERE "date" >= ?
+  AND "date" < ?
+"#,
+            )
+            .bind(query.created_from_unix_secs as i64)
+            .bind(query.created_until_unix_secs as i64)
+            .fetch_one(&self.pool)
+            .await
+            .map_sql_err()?
+        };
+
+        let fallback_count = if query.user_id.is_some() {
+            0
+        } else {
+            sqlite_aggregate_u64(&row, "fallback_count")?
+        };
+        let covered_from = row
+            .try_get::<Option<i64>, _>("covered_from")
+            .map_sql_err()?
+            .unwrap_or_default()
+            .max(0) as u64;
+        let covered_until = row
+            .try_get::<Option<i64>, _>("covered_until")
+            .map_sql_err()?
+            .unwrap_or_default()
+            .max(0) as u64;
+
+        Ok(Some(StoredUsageDashboardAggregateSummary {
+            summary: StoredUsageDashboardSummary {
+                total_requests,
+                input_tokens: sqlite_aggregate_u64(&row, "input_tokens")?,
+                effective_input_tokens: sqlite_aggregate_u64(&row, "effective_input_tokens")?,
+                output_tokens: sqlite_aggregate_u64(&row, "output_tokens")?,
+                total_tokens: sqlite_aggregate_u64(&row, "total_tokens")?,
+                cache_creation_tokens: sqlite_aggregate_u64(&row, "cache_creation_tokens")?,
+                cache_read_tokens: sqlite_aggregate_u64(&row, "cache_read_tokens")?,
+                total_input_context: sqlite_aggregate_u64(&row, "total_input_context")?,
+                cache_creation_cost_usd: sqlite_real(&row, "cache_creation_cost_usd")?,
+                cache_read_cost_usd: sqlite_real(&row, "cache_read_cost_usd")?,
+                total_cost_usd: sqlite_real(&row, "total_cost_usd")?,
+                actual_total_cost_usd: sqlite_real(&row, "actual_total_cost_usd")?,
+                error_requests: sqlite_aggregate_u64(&row, "error_requests")?,
+                response_time_sum_ms: sqlite_real(&response_row, "response_time_sum_ms")?,
+                response_time_samples: sqlite_aggregate_u64(
+                    &response_row,
+                    "response_time_samples",
+                )?,
+                fallback_count,
+            },
+            covered_from_unix_secs: covered_from,
+            covered_until_unix_secs: covered_until,
         }))
     }
 
@@ -2396,6 +2460,155 @@ ORDER BY "date" ASC
             }
         }
         Ok(items)
+    }
+
+    /// Summarize the raw usage table for an arbitrary UTC-second window.
+    async fn summarize_dashboard_usage_raw(
+        &self,
+        created_from_unix_secs: u64,
+        created_until_unix_secs: u64,
+        user_id: Option<&str>,
+    ) -> Result<StoredUsageDashboardSummary, DataLayerError> {
+        if created_from_unix_secs >= created_until_unix_secs {
+            return Ok(StoredUsageDashboardSummary::default());
+        }
+
+        let mut builder = QueryBuilder::<Sqlite>::new(format!(
+            r#"
+SELECT
+  COUNT(*) AS total_requests,
+  COALESCE(SUM(MAX(COALESCE(input_tokens, 0), 0)), 0) AS input_tokens,
+  COALESCE(SUM({effective_input_expr}), 0) AS effective_input_tokens,
+  COALESCE(SUM(MAX(COALESCE(output_tokens, 0), 0)), 0) AS output_tokens,
+  COALESCE(SUM({total_tokens_expr}), 0) AS total_tokens,
+  COALESCE(SUM({cache_creation_expr}), 0) AS cache_creation_tokens,
+  COALESCE(SUM(MAX(COALESCE(cache_read_input_tokens, 0), 0)), 0) AS cache_read_tokens,
+  COALESCE(SUM({total_input_context_expr}), 0) AS total_input_context,
+  COALESCE(SUM(COALESCE(CAST(cache_creation_cost_usd AS REAL), 0)), 0)
+    AS cache_creation_cost_usd,
+  COALESCE(SUM(COALESCE(CAST(cache_read_cost_usd AS REAL), 0)), 0)
+    AS cache_read_cost_usd,
+  COALESCE(SUM(COALESCE(CAST(total_cost_usd AS REAL), 0)), 0) AS total_cost_usd,
+  COALESCE(SUM(COALESCE(CAST(actual_total_cost_usd AS REAL), 0)), 0)
+    AS actual_total_cost_usd,
+  COALESCE(SUM(CASE WHEN COALESCE(status_code, 0) >= 400 OR status = 'failed' THEN 1 ELSE 0 END), 0)
+    AS error_requests,
+  COALESCE(SUM(CASE WHEN response_time_ms IS NOT NULL THEN MAX(COALESCE(response_time_ms, 0), 0) ELSE 0 END), 0)
+    AS response_time_sum_ms,
+  COALESCE(SUM(CASE WHEN response_time_ms IS NOT NULL THEN 1 ELSE 0 END), 0)
+    AS response_time_samples,
+  (SELECT COUNT(*) FROM (
+    SELECT request_id
+    FROM request_candidates
+    WHERE created_at >= {created_from_ms}
+      AND created_at < {created_until_ms}
+      AND status IN ('success', 'failed')
+    GROUP BY request_id
+    HAVING COUNT(id) > 1
+  )) AS fallback_count
+FROM "usage"
+LEFT JOIN usage_settlement_snapshots AS settlement
+  ON settlement.request_id = "usage".request_id
+"#,
+            effective_input_expr = SQLITE_USAGE_EFFECTIVE_INPUT_TOKENS_EXPR,
+            total_tokens_expr = SQLITE_USAGE_CANONICAL_TOTAL_TOKENS_EXPR,
+            cache_creation_expr = SQLITE_USAGE_CACHE_CREATION_TOKENS_EXPR,
+            total_input_context_expr = SQLITE_USAGE_TOTAL_INPUT_CONTEXT_EXPR,
+            created_from_ms = created_from_unix_secs.saturating_mul(1000),
+            created_until_ms = created_until_unix_secs.saturating_mul(1000),
+        ));
+        let mut has_where = false;
+        push_sqlite_usage_range(
+            &mut builder,
+            &mut has_where,
+            created_from_unix_secs,
+            created_until_unix_secs,
+        );
+        push_sqlite_usage_finalized_filter(&mut builder, &mut has_where);
+        push_sqlite_usage_optional_text_filter(&mut builder, &mut has_where, "user_id", user_id);
+
+        let row = builder.build().fetch_one(&self.pool).await.map_sql_err()?;
+        Ok(StoredUsageDashboardSummary {
+            total_requests: sqlite_aggregate_u64(&row, "total_requests")?,
+            input_tokens: sqlite_aggregate_u64(&row, "input_tokens")?,
+            effective_input_tokens: sqlite_aggregate_u64(&row, "effective_input_tokens")?,
+            output_tokens: sqlite_aggregate_u64(&row, "output_tokens")?,
+            total_tokens: sqlite_aggregate_u64(&row, "total_tokens")?,
+            cache_creation_tokens: sqlite_aggregate_u64(&row, "cache_creation_tokens")?,
+            cache_read_tokens: sqlite_aggregate_u64(&row, "cache_read_tokens")?,
+            total_input_context: sqlite_aggregate_u64(&row, "total_input_context")?,
+            cache_creation_cost_usd: sqlite_real(&row, "cache_creation_cost_usd")?,
+            cache_read_cost_usd: sqlite_real(&row, "cache_read_cost_usd")?,
+            total_cost_usd: sqlite_real(&row, "total_cost_usd")?,
+            actual_total_cost_usd: sqlite_real(&row, "actual_total_cost_usd")?,
+            error_requests: sqlite_aggregate_u64(&row, "error_requests")?,
+            response_time_sum_ms: sqlite_real(&row, "response_time_sum_ms")?,
+            response_time_samples: sqlite_aggregate_u64(&row, "response_time_samples")?,
+            fallback_count: sqlite_aggregate_u64(&row, "fallback_count")?,
+        })
+    }
+
+    /// Group raw usage rows by local date (tz_offset_minutes) or UTC date (0).
+    async fn list_dashboard_daily_breakdown_raw(
+        &self,
+        query: &UsageDashboardDailyBreakdownQuery,
+    ) -> Result<Vec<StoredUsageDashboardDailyBreakdownRow>, DataLayerError> {
+        let date_expr = sqlite_usage_local_date_expr(query.tz_offset_minutes);
+        let mut builder = QueryBuilder::<Sqlite>::new(format!(
+            r#"
+SELECT
+  {date_expr} AS date,
+  model,
+  provider_name AS provider,
+  COUNT(*) AS requests,
+  COALESCE(SUM({total_tokens_expr}), 0) AS total_tokens,
+  COALESCE(SUM(COALESCE(CAST(total_cost_usd AS REAL), 0)), 0) AS total_cost_usd,
+  COALESCE(SUM(CASE WHEN response_time_ms IS NOT NULL THEN MAX(COALESCE(response_time_ms, 0), 0) ELSE 0 END), 0)
+    AS response_time_sum_ms,
+  COALESCE(SUM(CASE WHEN response_time_ms IS NOT NULL THEN 1 ELSE 0 END), 0)
+    AS response_time_samples
+FROM "usage"
+LEFT JOIN usage_settlement_snapshots AS settlement
+  ON settlement.request_id = "usage".request_id
+"#,
+            total_tokens_expr = SQLITE_USAGE_CANONICAL_TOTAL_TOKENS_EXPR
+        ));
+        let mut has_where = false;
+        push_sqlite_usage_range(
+            &mut builder,
+            &mut has_where,
+            query.created_from_unix_secs,
+            query.created_until_unix_secs,
+        );
+        push_sqlite_usage_finalized_filter(&mut builder, &mut has_where);
+        push_sqlite_usage_optional_text_filter(
+            &mut builder,
+            &mut has_where,
+            "user_id",
+            query.user_id.as_deref(),
+        );
+        builder.push(
+            r#"
+GROUP BY date, model, provider
+ORDER BY date ASC, total_cost_usd DESC, model ASC, provider ASC
+"#,
+        );
+
+        let rows = builder.build().fetch_all(&self.pool).await.map_sql_err()?;
+        rows.iter()
+            .map(|row| {
+                Ok(StoredUsageDashboardDailyBreakdownRow {
+                    date: row.try_get("date").map_sql_err()?,
+                    model: row.try_get("model").map_sql_err()?,
+                    provider: row.try_get("provider").map_sql_err()?,
+                    requests: sqlite_aggregate_u64(row, "requests")?,
+                    total_tokens: sqlite_aggregate_u64(row, "total_tokens")?,
+                    total_cost_usd: sqlite_real(row, "total_cost_usd")?,
+                    response_time_sum_ms: sqlite_real(row, "response_time_sum_ms")?,
+                    response_time_samples: sqlite_aggregate_u64(row, "response_time_samples")?,
+                })
+            })
+            .collect()
     }
 }
 
@@ -2760,79 +2973,44 @@ ORDER BY created_at_unix_ms ASC, id ASC
             return Ok(StoredUsageDashboardSummary::default());
         }
 
-        if let Some(summary) = self
+        let Some(aggregate) = self
             .summarize_dashboard_usage_from_daily_aggregates(query)
             .await?
-        {
-            return Ok(summary);
+        else {
+            return self
+                .summarize_dashboard_usage_raw(
+                    query.created_from_unix_secs,
+                    query.created_until_unix_secs,
+                    query.user_id.as_deref(),
+                )
+                .await;
+        };
+        let mut summary = aggregate.summary;
+
+        // Daily aggregates only cover complete UTC days; answer the uncovered
+        // head/tail of the requested window from the raw usage table so ranges
+        // that include today do not silently drop recent traffic.
+        if aggregate.covered_from_unix_secs > query.created_from_unix_secs {
+            let head = self
+                .summarize_dashboard_usage_raw(
+                    query.created_from_unix_secs,
+                    aggregate.covered_from_unix_secs,
+                    query.user_id.as_deref(),
+                )
+                .await?;
+            summary.absorb(&head);
         }
-
-        let mut builder = QueryBuilder::<Sqlite>::new(format!(
-            r#"
-SELECT
-  COUNT(*) AS total_requests,
-  COALESCE(SUM(MAX(COALESCE(input_tokens, 0), 0)), 0) AS input_tokens,
-  COALESCE(SUM({effective_input_expr}), 0) AS effective_input_tokens,
-  COALESCE(SUM(MAX(COALESCE(output_tokens, 0), 0)), 0) AS output_tokens,
-  COALESCE(SUM({total_tokens_expr}), 0) AS total_tokens,
-  COALESCE(SUM({cache_creation_expr}), 0) AS cache_creation_tokens,
-  COALESCE(SUM(MAX(COALESCE(cache_read_input_tokens, 0), 0)), 0) AS cache_read_tokens,
-  COALESCE(SUM({total_input_context_expr}), 0) AS total_input_context,
-  COALESCE(SUM(COALESCE(CAST(cache_creation_cost_usd AS REAL), 0)), 0)
-    AS cache_creation_cost_usd,
-  COALESCE(SUM(COALESCE(CAST(cache_read_cost_usd AS REAL), 0)), 0)
-    AS cache_read_cost_usd,
-  COALESCE(SUM(COALESCE(CAST(total_cost_usd AS REAL), 0)), 0) AS total_cost_usd,
-  COALESCE(SUM(COALESCE(CAST(actual_total_cost_usd AS REAL), 0)), 0)
-    AS actual_total_cost_usd,
-  COALESCE(SUM(CASE WHEN COALESCE(status_code, 0) >= 400 OR status = 'failed' THEN 1 ELSE 0 END), 0)
-    AS error_requests,
-  COALESCE(SUM(CASE WHEN response_time_ms IS NOT NULL THEN MAX(COALESCE(response_time_ms, 0), 0) ELSE 0 END), 0)
-    AS response_time_sum_ms,
-  COALESCE(SUM(CASE WHEN response_time_ms IS NOT NULL THEN 1 ELSE 0 END), 0)
-    AS response_time_samples
-FROM "usage"
-LEFT JOIN usage_settlement_snapshots AS settlement
-  ON settlement.request_id = "usage".request_id
-"#,
-            effective_input_expr = SQLITE_USAGE_EFFECTIVE_INPUT_TOKENS_EXPR,
-            total_tokens_expr = SQLITE_USAGE_CANONICAL_TOTAL_TOKENS_EXPR,
-            cache_creation_expr = SQLITE_USAGE_CACHE_CREATION_TOKENS_EXPR,
-            total_input_context_expr = SQLITE_USAGE_TOTAL_INPUT_CONTEXT_EXPR
-        ));
-        let mut has_where = false;
-        push_sqlite_usage_range(
-            &mut builder,
-            &mut has_where,
-            query.created_from_unix_secs,
-            query.created_until_unix_secs,
-        );
-        push_sqlite_usage_finalized_filter(&mut builder, &mut has_where);
-        push_sqlite_usage_optional_text_filter(
-            &mut builder,
-            &mut has_where,
-            "user_id",
-            query.user_id.as_deref(),
-        );
-
-        let row = builder.build().fetch_one(&self.pool).await.map_sql_err()?;
-        Ok(StoredUsageDashboardSummary {
-            total_requests: sqlite_aggregate_u64(&row, "total_requests")?,
-            input_tokens: sqlite_aggregate_u64(&row, "input_tokens")?,
-            effective_input_tokens: sqlite_aggregate_u64(&row, "effective_input_tokens")?,
-            output_tokens: sqlite_aggregate_u64(&row, "output_tokens")?,
-            total_tokens: sqlite_aggregate_u64(&row, "total_tokens")?,
-            cache_creation_tokens: sqlite_aggregate_u64(&row, "cache_creation_tokens")?,
-            cache_read_tokens: sqlite_aggregate_u64(&row, "cache_read_tokens")?,
-            total_input_context: sqlite_aggregate_u64(&row, "total_input_context")?,
-            cache_creation_cost_usd: sqlite_real(&row, "cache_creation_cost_usd")?,
-            cache_read_cost_usd: sqlite_real(&row, "cache_read_cost_usd")?,
-            total_cost_usd: sqlite_real(&row, "total_cost_usd")?,
-            actual_total_cost_usd: sqlite_real(&row, "actual_total_cost_usd")?,
-            error_requests: sqlite_aggregate_u64(&row, "error_requests")?,
-            response_time_sum_ms: sqlite_real(&row, "response_time_sum_ms")?,
-            response_time_samples: sqlite_aggregate_u64(&row, "response_time_samples")?,
-        })
+        if aggregate.covered_until_unix_secs < query.created_until_unix_secs {
+            let tail = self
+                .summarize_dashboard_usage_raw(
+                    aggregate.covered_until_unix_secs,
+                    query.created_until_unix_secs,
+                    query.user_id.as_deref(),
+                )
+                .await?;
+            summary.absorb(&tail);
+        }
+        Ok(summary)
     }
 
     async fn list_dashboard_daily_breakdown(
@@ -2847,65 +3025,38 @@ LEFT JOIN usage_settlement_snapshots AS settlement
             .list_dashboard_daily_breakdown_from_daily_aggregates(query)
             .await?;
         if !aggregate_rows.is_empty() {
+            // Aggregate rows are keyed by complete UTC days; the trailing part
+            // of the window (today) is never aggregated yet, so answer it from
+            // the raw usage table. Group by UTC days (tz offset 0) to keep the
+            // same day semantics as the aggregate rows and avoid double
+            // counting when both sources are merged.
+            let covered_until_secs = aggregate_rows
+                .iter()
+                .filter_map(|row| chrono::NaiveDate::parse_from_str(&row.date, "%Y-%m-%d").ok())
+                .filter_map(|date| date.and_hms_opt(0, 0, 0))
+                .map(|midnight| midnight.and_utc().timestamp())
+                .max()
+                .unwrap_or(0)
+                .saturating_add(86_400)
+                .max(0) as u64;
+            let tail_from = covered_until_secs.max(query.created_from_unix_secs);
+            if tail_from < query.created_until_unix_secs {
+                let tail_rows = self
+                    .list_dashboard_daily_breakdown_raw(&UsageDashboardDailyBreakdownQuery {
+                        created_from_unix_secs: tail_from,
+                        created_until_unix_secs: query.created_until_unix_secs,
+                        tz_offset_minutes: 0,
+                        user_id: query.user_id.clone(),
+                    })
+                    .await?;
+                let mut rows = aggregate_rows;
+                rows.extend(tail_rows);
+                return Ok(rows);
+            }
             return Ok(aggregate_rows);
         }
 
-        let date_expr = sqlite_usage_local_date_expr(query.tz_offset_minutes);
-        let mut builder = QueryBuilder::<Sqlite>::new(format!(
-            r#"
-SELECT
-  {date_expr} AS date,
-  model,
-  provider_name AS provider,
-  COUNT(*) AS requests,
-  COALESCE(SUM({total_tokens_expr}), 0) AS total_tokens,
-  COALESCE(SUM(COALESCE(CAST(total_cost_usd AS REAL), 0)), 0) AS total_cost_usd,
-  COALESCE(SUM(CASE WHEN response_time_ms IS NOT NULL THEN MAX(COALESCE(response_time_ms, 0), 0) ELSE 0 END), 0)
-    AS response_time_sum_ms,
-  COALESCE(SUM(CASE WHEN response_time_ms IS NOT NULL THEN 1 ELSE 0 END), 0)
-    AS response_time_samples
-FROM "usage"
-LEFT JOIN usage_settlement_snapshots AS settlement
-  ON settlement.request_id = "usage".request_id
-"#,
-            total_tokens_expr = SQLITE_USAGE_CANONICAL_TOTAL_TOKENS_EXPR
-        ));
-        let mut has_where = false;
-        push_sqlite_usage_range(
-            &mut builder,
-            &mut has_where,
-            query.created_from_unix_secs,
-            query.created_until_unix_secs,
-        );
-        push_sqlite_usage_finalized_filter(&mut builder, &mut has_where);
-        push_sqlite_usage_optional_text_filter(
-            &mut builder,
-            &mut has_where,
-            "user_id",
-            query.user_id.as_deref(),
-        );
-        builder.push(
-            r#"
-GROUP BY date, model, provider
-ORDER BY date ASC, total_cost_usd DESC, model ASC, provider ASC
-"#,
-        );
-
-        let rows = builder.build().fetch_all(&self.pool).await.map_sql_err()?;
-        rows.iter()
-            .map(|row| {
-                Ok(StoredUsageDashboardDailyBreakdownRow {
-                    date: row.try_get("date").map_sql_err()?,
-                    model: row.try_get("model").map_sql_err()?,
-                    provider: row.try_get("provider").map_sql_err()?,
-                    requests: sqlite_aggregate_u64(row, "requests")?,
-                    total_tokens: sqlite_aggregate_u64(row, "total_tokens")?,
-                    total_cost_usd: sqlite_real(row, "total_cost_usd")?,
-                    response_time_sum_ms: sqlite_real(row, "response_time_sum_ms")?,
-                    response_time_samples: sqlite_aggregate_u64(row, "response_time_samples")?,
-                })
-            })
-            .collect()
+        self.list_dashboard_daily_breakdown_raw(query).await
     }
 
     async fn summarize_dashboard_provider_counts(

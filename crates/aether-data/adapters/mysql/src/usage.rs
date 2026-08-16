@@ -8,9 +8,10 @@ use sqlx::{mysql::MySqlRow, MySql, QueryBuilder, Row};
 use aether_data_contracts::repository::usage::{
     strip_deprecated_usage_display_fields, usage_can_recover_terminal_failure,
     usage_request_metadata_client_family, PendingUsageCleanupSummary, StoredRequestUsageAudit,
-    StoredUsageDailySummary, StoredUsageDashboardDailyBreakdownRow, StoredUsageDashboardSummary,
-    StoredUsageUserTotals, UpsertUsageRecord, UsageCleanupExecutionMode, UsageCleanupPreviewCounts,
-    UsageCleanupSummary, UsageCleanupTargets, UsageCleanupWindow, UsageDailyHeatmapQuery,
+    StoredUsageDailySummary, StoredUsageDashboardAggregateSummary,
+    StoredUsageDashboardDailyBreakdownRow, StoredUsageDashboardSummary, StoredUsageUserTotals,
+    UpsertUsageRecord, UsageCleanupExecutionMode, UsageCleanupPreviewCounts, UsageCleanupSummary,
+    UsageCleanupTargets, UsageCleanupWindow, UsageDailyHeatmapQuery,
     UsageDashboardDailyBreakdownQuery, UsageDashboardSummaryQuery, UsageWriteRepository,
 };
 use aether_data_contracts::DataLayerError;
@@ -720,7 +721,7 @@ ORDER BY `date` ASC
     pub async fn summarize_dashboard_usage_from_daily_aggregates(
         &self,
         query: &UsageDashboardSummaryQuery,
-    ) -> Result<Option<StoredUsageDashboardSummary>, DataLayerError> {
+    ) -> Result<Option<StoredUsageDashboardAggregateSummary>, DataLayerError> {
         let row = if let Some(user_id) = query.user_id.as_deref() {
             sqlx::query(
                 r#"
@@ -738,8 +739,8 @@ SELECT
   CAST(COALESCE(SUM(COALESCE(total_cost, 0)), 0) AS DOUBLE) AS total_cost_usd,
   CAST(COALESCE(SUM(COALESCE(total_cost, 0)), 0) AS DOUBLE) AS actual_total_cost_usd,
   CAST(COALESCE(SUM(error_requests), 0) AS SIGNED) AS error_requests,
-  CAST(0.0 AS DOUBLE) AS response_time_sum_ms,
-  CAST(0 AS SIGNED) AS response_time_samples
+  MIN(`date`) AS covered_from,
+  MAX(`date`) + 86400 AS covered_until
 FROM stats_user_daily
 WHERE user_id = ?
   AND `date` >= ?
@@ -775,8 +776,9 @@ SELECT
   CAST(COALESCE(SUM(COALESCE(total_cost, 0)), 0) AS DOUBLE) AS total_cost_usd,
   CAST(COALESCE(SUM(COALESCE(actual_total_cost, 0)), 0) AS DOUBLE) AS actual_total_cost_usd,
   CAST(COALESCE(SUM(error_requests), 0) AS SIGNED) AS error_requests,
-  CAST(0.0 AS DOUBLE) AS response_time_sum_ms,
-  CAST(0 AS SIGNED) AS response_time_samples
+  CAST(COALESCE(SUM(fallback_count), 0) AS SIGNED) AS fallback_count,
+  MIN(`date`) AS covered_from,
+  MAX(`date`) + 86400 AS covered_until
 FROM stats_daily
 WHERE `date` >= ?
   AND `date` < ?
@@ -794,22 +796,93 @@ WHERE `date` >= ?
             return Ok(None);
         }
 
-        Ok(Some(StoredUsageDashboardSummary {
-            total_requests,
-            input_tokens: row_u64(&row, "input_tokens")?,
-            effective_input_tokens: row_u64(&row, "effective_input_tokens")?,
-            output_tokens: row_u64(&row, "output_tokens")?,
-            total_tokens: row_u64(&row, "total_tokens")?,
-            cache_creation_tokens: row_u64(&row, "cache_creation_tokens")?,
-            cache_read_tokens: row_u64(&row, "cache_read_tokens")?,
-            total_input_context: row_u64(&row, "total_input_context")?,
-            cache_creation_cost_usd: row.try_get("cache_creation_cost_usd").map_sql_err()?,
-            cache_read_cost_usd: row.try_get("cache_read_cost_usd").map_sql_err()?,
-            total_cost_usd: row.try_get("total_cost_usd").map_sql_err()?,
-            actual_total_cost_usd: row.try_get("actual_total_cost_usd").map_sql_err()?,
-            error_requests: row_u64(&row, "error_requests")?,
-            response_time_sum_ms: row.try_get("response_time_sum_ms").map_sql_err()?,
-            response_time_samples: row_u64(&row, "response_time_samples")?,
+        // The totals tables only keep avg_response_time_ms; the model/provider
+        // dimension tables carry the exact response-time sums.
+        let response_row = if let Some(user_id) = query.user_id.as_deref() {
+            sqlx::query(
+                r#"
+SELECT
+  CAST(COALESCE(SUM(response_time_sum_ms), 0) AS DOUBLE) AS response_time_sum_ms,
+  CAST(COALESCE(SUM(response_time_samples), 0) AS SIGNED) AS response_time_samples
+FROM stats_user_daily_model_provider
+WHERE user_id = ?
+  AND `date` >= ?
+  AND `date` < ?
+"#,
+            )
+            .bind(user_id)
+            .bind(to_i64(
+                query.created_from_unix_secs,
+                "stats_user_daily_model_provider.date",
+            )?)
+            .bind(to_i64(
+                query.created_until_unix_secs,
+                "stats_user_daily_model_provider.date",
+            )?)
+            .fetch_one(&self.pool)
+            .await
+            .map_sql_err()?
+        } else {
+            sqlx::query(
+                r#"
+SELECT
+  CAST(COALESCE(SUM(response_time_sum_ms), 0) AS DOUBLE) AS response_time_sum_ms,
+  CAST(COALESCE(SUM(response_time_samples), 0) AS SIGNED) AS response_time_samples
+FROM stats_daily_model_provider
+WHERE `date` >= ?
+  AND `date` < ?
+"#,
+            )
+            .bind(to_i64(
+                query.created_from_unix_secs,
+                "stats_daily_model_provider.date",
+            )?)
+            .bind(to_i64(
+                query.created_until_unix_secs,
+                "stats_daily_model_provider.date",
+            )?)
+            .fetch_one(&self.pool)
+            .await
+            .map_sql_err()?
+        };
+
+        let fallback_count = if query.user_id.is_some() {
+            0
+        } else {
+            row_u64(&row, "fallback_count")?
+        };
+        let covered_from = row
+            .try_get::<Option<i64>, _>("covered_from")
+            .map_sql_err()?
+            .unwrap_or_default()
+            .max(0) as u64;
+        let covered_until = row
+            .try_get::<Option<i64>, _>("covered_until")
+            .map_sql_err()?
+            .unwrap_or_default()
+            .max(0) as u64;
+
+        Ok(Some(StoredUsageDashboardAggregateSummary {
+            summary: StoredUsageDashboardSummary {
+                total_requests,
+                input_tokens: row_u64(&row, "input_tokens")?,
+                effective_input_tokens: row_u64(&row, "effective_input_tokens")?,
+                output_tokens: row_u64(&row, "output_tokens")?,
+                total_tokens: row_u64(&row, "total_tokens")?,
+                cache_creation_tokens: row_u64(&row, "cache_creation_tokens")?,
+                cache_read_tokens: row_u64(&row, "cache_read_tokens")?,
+                total_input_context: row_u64(&row, "total_input_context")?,
+                cache_creation_cost_usd: row.try_get("cache_creation_cost_usd").map_sql_err()?,
+                cache_read_cost_usd: row.try_get("cache_read_cost_usd").map_sql_err()?,
+                total_cost_usd: row.try_get("total_cost_usd").map_sql_err()?,
+                actual_total_cost_usd: row.try_get("actual_total_cost_usd").map_sql_err()?,
+                error_requests: row_u64(&row, "error_requests")?,
+                response_time_sum_ms: row.try_get("response_time_sum_ms").map_sql_err()?,
+                response_time_samples: row_u64(&response_row, "response_time_samples")?,
+                fallback_count,
+            },
+            covered_from_unix_secs: covered_from,
+            covered_until_unix_secs: covered_until,
         }))
     }
 
