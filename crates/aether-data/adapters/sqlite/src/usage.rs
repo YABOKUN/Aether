@@ -1113,6 +1113,21 @@ fn sqlite_optional_u64(row: &SqliteRow, field: &str) -> Result<Option<u64>, Data
         .map(|value| value.max(0) as u64))
 }
 
+fn sqlite_dashboard_daily_breakdown_row(
+    row: &SqliteRow,
+) -> Result<StoredUsageDashboardDailyBreakdownRow, DataLayerError> {
+    Ok(StoredUsageDashboardDailyBreakdownRow {
+        date: row.try_get("date").map_sql_err()?,
+        model: row.try_get("model").map_sql_err()?,
+        provider: row.try_get("provider").map_sql_err()?,
+        requests: sqlite_aggregate_u64(row, "requests")?,
+        total_tokens: sqlite_aggregate_u64(row, "total_tokens")?,
+        total_cost_usd: sqlite_real(row, "total_cost_usd")?,
+        response_time_sum_ms: sqlite_real(row, "response_time_sum_ms")?,
+        response_time_samples: sqlite_aggregate_u64(row, "response_time_samples")?,
+    })
+}
+
 fn push_sqlite_usage_provider_performance_base_filters(
     builder: &mut QueryBuilder<'_, Sqlite>,
     query: &UsageProviderPerformanceQuery,
@@ -2252,9 +2267,72 @@ WHERE "date" >= ?
         &self,
         query: &UsageDashboardDailyBreakdownQuery,
     ) -> Result<Vec<StoredUsageDashboardDailyBreakdownRow>, DataLayerError> {
-        let rows = if let Some(user_id) = query.user_id.as_deref() {
-            sqlx::query(
-                r#"
+        let dimension_sql = if query.user_id.is_some() {
+            r#"
+SELECT
+  date("date", 'unixepoch') AS date,
+  model,
+  provider_name AS provider,
+  COALESCE(SUM(total_requests), 0) AS requests,
+  COALESCE(SUM(total_tokens), 0) AS total_tokens,
+  COALESCE(SUM(COALESCE(CAST(total_cost AS REAL), 0)), 0) AS total_cost_usd,
+  COALESCE(SUM(response_time_sum_ms), 0) AS response_time_sum_ms,
+  COALESCE(SUM(response_time_samples), 0) AS response_time_samples
+FROM stats_user_daily_model_provider
+WHERE user_id = ?
+  AND "date" >= ?
+  AND "date" < ?
+  AND total_requests > 0
+GROUP BY "date", model, provider_name
+ORDER BY "date" ASC, total_cost_usd DESC, model ASC, provider_name ASC
+"#
+        } else {
+            r#"
+SELECT
+  date("date", 'unixepoch') AS date,
+  model,
+  provider_name AS provider,
+  COALESCE(SUM(total_requests), 0) AS requests,
+  COALESCE(SUM(total_tokens), 0) AS total_tokens,
+  COALESCE(SUM(COALESCE(CAST(total_cost AS REAL), 0)), 0) AS total_cost_usd,
+  COALESCE(SUM(response_time_sum_ms), 0) AS response_time_sum_ms,
+  COALESCE(SUM(response_time_samples), 0) AS response_time_samples
+FROM stats_daily_model_provider
+WHERE "date" >= ?
+  AND "date" < ?
+  AND total_requests > 0
+GROUP BY "date", model, provider_name
+ORDER BY "date" ASC, total_cost_usd DESC, model ASC, provider_name ASC
+"#
+        };
+
+        let dimension_rows = if let Some(user_id) = query.user_id.as_deref() {
+            sqlx::query(dimension_sql)
+                .bind(user_id)
+                .bind(query.created_from_unix_secs as i64)
+                .bind(query.created_until_unix_secs as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_sql_err()?
+        } else {
+            sqlx::query(dimension_sql)
+                .bind(query.created_from_unix_secs as i64)
+                .bind(query.created_until_unix_secs as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_sql_err()?
+        };
+
+        let mut items = Vec::with_capacity(dimension_rows.len());
+        let mut detailed_dates = std::collections::BTreeSet::new();
+        for row in &dimension_rows {
+            let item = sqlite_dashboard_daily_breakdown_row(row)?;
+            detailed_dates.insert(item.date.clone());
+            items.push(item);
+        }
+
+        let totals_sql = if query.user_id.is_some() {
+            r#"
 SELECT
   date("date", 'unixepoch') AS date,
   'aggregate' AS model,
@@ -2271,17 +2349,9 @@ WHERE user_id = ?
   AND total_requests > 0
 GROUP BY "date"
 ORDER BY "date" ASC
-"#,
-            )
-            .bind(user_id)
-            .bind(query.created_from_unix_secs as i64)
-            .bind(query.created_until_unix_secs as i64)
-            .fetch_all(&self.pool)
-            .await
-            .map_sql_err()?
+"#
         } else {
-            sqlx::query(
-                r#"
+            r#"
 SELECT
   date("date", 'unixepoch') AS date,
   'aggregate' AS model,
@@ -2297,29 +2367,35 @@ WHERE "date" >= ?
   AND total_requests > 0
 GROUP BY "date"
 ORDER BY "date" ASC
-"#,
-            )
-            .bind(query.created_from_unix_secs as i64)
-            .bind(query.created_until_unix_secs as i64)
-            .fetch_all(&self.pool)
-            .await
-            .map_sql_err()?
+"#
         };
 
-        rows.iter()
-            .map(|row| {
-                Ok(StoredUsageDashboardDailyBreakdownRow {
-                    date: row.try_get("date").map_sql_err()?,
-                    model: row.try_get("model").map_sql_err()?,
-                    provider: row.try_get("provider").map_sql_err()?,
-                    requests: sqlite_aggregate_u64(row, "requests")?,
-                    total_tokens: sqlite_aggregate_u64(row, "total_tokens")?,
-                    total_cost_usd: sqlite_real(row, "total_cost_usd")?,
-                    response_time_sum_ms: sqlite_real(row, "response_time_sum_ms")?,
-                    response_time_samples: sqlite_aggregate_u64(row, "response_time_samples")?,
-                })
-            })
-            .collect()
+        let totals_rows = if let Some(user_id) = query.user_id.as_deref() {
+            sqlx::query(totals_sql)
+                .bind(user_id)
+                .bind(query.created_from_unix_secs as i64)
+                .bind(query.created_until_unix_secs as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_sql_err()?
+        } else {
+            sqlx::query(totals_sql)
+                .bind(query.created_from_unix_secs as i64)
+                .bind(query.created_until_unix_secs as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_sql_err()?
+        };
+
+        // Days aggregated before stats_daily_model_provider existed only carry totals;
+        // keep them visible as aggregate rows instead of dropping the day entirely.
+        for row in &totals_rows {
+            let item = sqlite_dashboard_daily_breakdown_row(row)?;
+            if !detailed_dates.contains(&item.date) {
+                items.push(item);
+            }
+        }
+        Ok(items)
     }
 }
 

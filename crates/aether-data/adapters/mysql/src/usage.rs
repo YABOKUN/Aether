@@ -817,9 +817,84 @@ WHERE `date` >= ?
         &self,
         query: &UsageDashboardDailyBreakdownQuery,
     ) -> Result<Vec<StoredUsageDashboardDailyBreakdownRow>, DataLayerError> {
-        let rows = if let Some(user_id) = query.user_id.as_deref() {
-            sqlx::query(
-                r#"
+        let dimension_sql = if query.user_id.is_some() {
+            r#"
+SELECT
+  DATE_FORMAT(FROM_UNIXTIME(`date`), '%Y-%m-%d') AS date,
+  model,
+  provider_name AS provider,
+  CAST(COALESCE(SUM(total_requests), 0) AS SIGNED) AS requests,
+  CAST(COALESCE(SUM(total_tokens), 0) AS SIGNED) AS total_tokens,
+  CAST(COALESCE(SUM(COALESCE(total_cost, 0)), 0) AS DOUBLE) AS total_cost_usd,
+  CAST(COALESCE(SUM(response_time_sum_ms), 0) AS DOUBLE) AS response_time_sum_ms,
+  CAST(COALESCE(SUM(response_time_samples), 0) AS SIGNED) AS response_time_samples
+FROM stats_user_daily_model_provider
+WHERE user_id = ?
+  AND `date` >= ?
+  AND `date` < ?
+  AND total_requests > 0
+GROUP BY `date`, model, provider_name
+ORDER BY `date` ASC, total_cost_usd DESC, model ASC, provider_name ASC
+"#
+        } else {
+            r#"
+SELECT
+  DATE_FORMAT(FROM_UNIXTIME(`date`), '%Y-%m-%d') AS date,
+  model,
+  provider_name AS provider,
+  CAST(COALESCE(SUM(total_requests), 0) AS SIGNED) AS requests,
+  CAST(COALESCE(SUM(total_tokens), 0) AS SIGNED) AS total_tokens,
+  CAST(COALESCE(SUM(COALESCE(total_cost, 0)), 0) AS DOUBLE) AS total_cost_usd,
+  CAST(COALESCE(SUM(response_time_sum_ms), 0) AS DOUBLE) AS response_time_sum_ms,
+  CAST(COALESCE(SUM(response_time_samples), 0) AS SIGNED) AS response_time_samples
+FROM stats_daily_model_provider
+WHERE `date` >= ?
+  AND `date` < ?
+  AND total_requests > 0
+GROUP BY `date`, model, provider_name
+ORDER BY `date` ASC, total_cost_usd DESC, model ASC, provider_name ASC
+"#
+        };
+
+        let dimension_rows = if let Some(user_id) = query.user_id.as_deref() {
+            sqlx::query(dimension_sql)
+                .bind(user_id)
+                .bind(to_i64(
+                    query.created_from_unix_secs,
+                    "stats_user_daily_model_provider.date",
+                )?)
+                .bind(to_i64(
+                    query.created_until_unix_secs,
+                    "stats_user_daily_model_provider.date",
+                )?)
+                .fetch_all(&self.pool)
+                .await
+                .map_sql_err()?
+        } else {
+            sqlx::query(dimension_sql)
+                .bind(to_i64(
+                    query.created_from_unix_secs,
+                    "stats_daily_model_provider.date",
+                )?)
+                .bind(to_i64(
+                    query.created_until_unix_secs,
+                    "stats_daily_model_provider.date",
+                )?)
+                .fetch_all(&self.pool)
+                .await
+                .map_sql_err()?
+        };
+
+        let mut items = Vec::with_capacity(dimension_rows.len());
+        let mut detailed_dates = std::collections::BTreeSet::new();
+        for row in &dimension_rows {
+            let item = mysql_dashboard_daily_breakdown_row(row)?;
+            detailed_dates.insert(item.date.clone());
+            items.push(item);
+        }
+
+        let totals_sql = if query.user_id.is_some() {
+            r#"
 SELECT
   DATE_FORMAT(FROM_UNIXTIME(`date`), '%Y-%m-%d') AS date,
   'aggregate' AS model,
@@ -836,23 +911,9 @@ WHERE user_id = ?
   AND total_requests > 0
 GROUP BY `date`
 ORDER BY `date` ASC
-"#,
-            )
-            .bind(user_id)
-            .bind(to_i64(
-                query.created_from_unix_secs,
-                "stats_user_daily.date",
-            )?)
-            .bind(to_i64(
-                query.created_until_unix_secs,
-                "stats_user_daily.date",
-            )?)
-            .fetch_all(&self.pool)
-            .await
-            .map_sql_err()?
+"#
         } else {
-            sqlx::query(
-                r#"
+            r#"
 SELECT
   DATE_FORMAT(FROM_UNIXTIME(`date`), '%Y-%m-%d') AS date,
   'aggregate' AS model,
@@ -868,29 +929,41 @@ WHERE `date` >= ?
   AND total_requests > 0
 GROUP BY `date`
 ORDER BY `date` ASC
-"#,
-            )
-            .bind(to_i64(query.created_from_unix_secs, "stats_daily.date")?)
-            .bind(to_i64(query.created_until_unix_secs, "stats_daily.date")?)
-            .fetch_all(&self.pool)
-            .await
-            .map_sql_err()?
+"#
         };
 
-        rows.iter()
-            .map(|row| {
-                Ok(StoredUsageDashboardDailyBreakdownRow {
-                    date: row.try_get("date").map_sql_err()?,
-                    model: row.try_get("model").map_sql_err()?,
-                    provider: row.try_get("provider").map_sql_err()?,
-                    requests: row_u64(row, "requests")?,
-                    total_tokens: row_u64(row, "total_tokens")?,
-                    total_cost_usd: row.try_get("total_cost_usd").map_sql_err()?,
-                    response_time_sum_ms: row.try_get("response_time_sum_ms").map_sql_err()?,
-                    response_time_samples: row_u64(row, "response_time_samples")?,
-                })
-            })
-            .collect()
+        let totals_rows = if let Some(user_id) = query.user_id.as_deref() {
+            sqlx::query(totals_sql)
+                .bind(user_id)
+                .bind(to_i64(
+                    query.created_from_unix_secs,
+                    "stats_user_daily.date",
+                )?)
+                .bind(to_i64(
+                    query.created_until_unix_secs,
+                    "stats_user_daily.date",
+                )?)
+                .fetch_all(&self.pool)
+                .await
+                .map_sql_err()?
+        } else {
+            sqlx::query(totals_sql)
+                .bind(to_i64(query.created_from_unix_secs, "stats_daily.date")?)
+                .bind(to_i64(query.created_until_unix_secs, "stats_daily.date")?)
+                .fetch_all(&self.pool)
+                .await
+                .map_sql_err()?
+        };
+
+        // Days aggregated before stats_daily_model_provider existed only carry totals;
+        // keep them visible as aggregate rows instead of dropping the day entirely.
+        for row in &totals_rows {
+            let item = mysql_dashboard_daily_breakdown_row(row)?;
+            if !detailed_dates.contains(&item.date) {
+                items.push(item);
+            }
+        }
+        Ok(items)
     }
 
     pub async fn summarize_usage_totals_by_user_ids(
@@ -1859,6 +1932,21 @@ fn map_mysql_usage_daily_summary(
         total_tokens: row_u64(row, "total_tokens")?,
         total_cost_usd: row.try_get("total_cost_usd").map_sql_err()?,
         actual_total_cost_usd: row.try_get("actual_total_cost_usd").map_sql_err()?,
+    })
+}
+
+fn mysql_dashboard_daily_breakdown_row(
+    row: &MySqlRow,
+) -> Result<StoredUsageDashboardDailyBreakdownRow, DataLayerError> {
+    Ok(StoredUsageDashboardDailyBreakdownRow {
+        date: row.try_get("date").map_sql_err()?,
+        model: row.try_get("model").map_sql_err()?,
+        provider: row.try_get("provider").map_sql_err()?,
+        requests: row_u64(row, "requests")?,
+        total_tokens: row_u64(row, "total_tokens")?,
+        total_cost_usd: row.try_get("total_cost_usd").map_sql_err()?,
+        response_time_sum_ms: row.try_get("response_time_sum_ms").map_sql_err()?,
+        response_time_samples: row_u64(row, "response_time_samples")?,
     })
 }
 

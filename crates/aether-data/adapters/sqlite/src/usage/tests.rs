@@ -1880,6 +1880,20 @@ INSERT INTO stats_daily (
     .await
     .expect("daily aggregates should seed");
 
+    sqlx::query(
+        r#"
+INSERT INTO stats_daily_model_provider (
+    id, "date", model, provider_name, total_requests, total_tokens, total_cost,
+    response_time_sum_ms, response_time_samples, created_at, updated_at
+) VALUES
+    ('daily-mp-1', 86400, 'gpt-4o', 'openai', 6, 25, 0.9, 1200.0, 6, 1, 1),
+    ('daily-mp-2', 86400, 'claude-3-5-sonnet', 'anthropic', 3, 12, 0.35, 900.0, 3, 1, 1);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("daily model provider aggregates should seed");
+
     let reader = SqliteUsageReadRepository::new(pool);
     let summary = reader
         .summarize_dashboard_usage(&UsageDashboardSummaryQuery {
@@ -1901,11 +1915,81 @@ INSERT INTO stats_daily (
         })
         .await
         .expect("dashboard daily breakdown should load");
-    assert_eq!(rows.len(), 1);
+    assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].date, "1970-01-02");
-    assert_eq!(rows[0].model, "aggregate");
-    assert_eq!(rows[0].requests, 9);
-    assert_eq!(rows[0].total_tokens, 37);
+    assert_eq!(rows[0].model, "gpt-4o");
+    assert_eq!(rows[0].provider, "openai");
+    assert_eq!(rows[0].requests, 6);
+    assert_eq!(rows[0].total_tokens, 25);
+    assert_eq!(rows[0].response_time_sum_ms, 1200.0);
+    assert_eq!(rows[0].response_time_samples, 6);
+    assert_eq!(rows[1].model, "claude-3-5-sonnet");
+    assert_eq!(rows[1].provider, "anthropic");
+    assert_eq!(rows[1].requests, 3);
+    assert_eq!(rows[1].total_tokens, 12);
+}
+
+#[tokio::test]
+async fn sqlite_dashboard_daily_stats_user_aggregates_fall_back_to_totals_for_legacy_days() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+
+    sqlx::query(
+        r#"
+INSERT INTO stats_user_daily_model_provider (
+    id, user_id, username, "date", model, provider_name, total_requests, total_tokens,
+    total_cost, response_time_sum_ms, response_time_samples, created_at, updated_at
+) VALUES (
+    'user-mp-1', 'user-1', 'alice', 86400, 'gpt-4o', 'openai', 4, 16, 0.5, 800.0, 4, 1, 1
+);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("user model provider aggregates should seed");
+
+    sqlx::query(
+        r#"
+INSERT INTO stats_user_daily (
+    id, user_id, "date", total_requests, success_requests, error_requests,
+    input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+    total_cost, created_at, updated_at
+) VALUES (
+    'user-daily-1', 'user-1', 172800, 5, 5, 0, 2, 3, 0, 0, 0.4, 1, 1
+);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy user daily totals should seed");
+
+    let reader = SqliteUsageReadRepository::new(pool);
+    let rows = reader
+        .list_dashboard_daily_breakdown(&UsageDashboardDailyBreakdownQuery {
+            created_from_unix_secs: 0,
+            created_until_unix_secs: 259200,
+            tz_offset_minutes: 0,
+            user_id: Some("user-1".to_string()),
+        })
+        .await
+        .expect("user dashboard daily breakdown should load");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].date, "1970-01-02");
+    assert_eq!(rows[0].model, "gpt-4o");
+    assert_eq!(rows[0].provider, "openai");
+    assert_eq!(rows[0].requests, 4);
+    assert_eq!(rows[0].total_tokens, 16);
+    assert_eq!(rows[1].date, "1970-01-03");
+    assert_eq!(rows[1].model, "aggregate");
+    assert_eq!(rows[1].provider, "aggregate");
+    assert_eq!(rows[1].requests, 5);
+    assert_eq!(rows[1].total_tokens, 5);
 }
 
 #[tokio::test]
