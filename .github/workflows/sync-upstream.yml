@@ -1,0 +1,89 @@
+name: Track upstream main
+
+on:
+  schedule:
+    - cron: '23 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: track-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  track:
+    name: Detect upstream change and dispatch build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v5
+
+      - name: Read last built SHA
+        id: last
+        run: |
+          if [[ -f .github/upstream-built-sha ]]; then
+            sha="$(tr -d '[:space:]' < .github/upstream-built-sha)"
+          else
+            sha="none"
+          fi
+          echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Fetch upstream main SHA
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha="$(gh api repos/fawney19/Aether/commits/main --jq .sha)"
+          echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Nothing to do
+        if: steps.last.outputs.sha == steps.upstream.outputs.sha
+        run: |
+          echo "Upstream main ${{ steps.upstream.outputs.sha }} is already built." >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Sync fork main with upstream
+        if: steps.last.outputs.sha != steps.upstream.outputs.sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          out="$(gh api "repos/${GITHUB_REPOSITORY}/merge-upstream" -f merge_method=merge 2>&1)"
+          code=$?
+          set -e
+          if [[ ${code} -eq 0 ]]; then
+            echo "Fork main synced with upstream."
+          else
+            echo "::warning::merge-upstream failed (continuing): ${out}"
+          fi
+
+      - name: Record SHA and dispatch build
+        if: steps.last.outputs.sha != steps.upstream.outputs.sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git reset --hard origin/main
+          printf '%s\n' "${UPSTREAM_SHA}" > .github/upstream-built-sha
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/upstream-built-sha
+          git commit -m "ci: record upstream main ${UPSTREAM_SHA}"
+          git push origin main
+          request_id="$(cat /proc/sys/kernel/random/uuid)"
+          gh workflow run upstream-main.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref main \
+            -f "upstream_sha=${UPSTREAM_SHA}" \
+            -f "request_id=${request_id}"
+          {
+            echo "Dispatched build for upstream main ${UPSTREAM_SHA}"
+            echo ""
+            echo "Image tags when done:"
+            echo "- ghcr.io/yabokun/aether:main-${UPSTREAM_SHA}"
+            echo "- ghcr.io/yabokun/aether:main"
+          } >> "${GITHUB_STEP_SUMMARY}"
