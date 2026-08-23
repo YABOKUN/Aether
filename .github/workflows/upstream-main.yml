@@ -1,0 +1,145 @@
+name: Build upstream Aether main
+
+run-name: Upstream main ${{ inputs.upstream_sha }} [${{ inputs.request_id }}]
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_sha:
+        description: Full commit SHA from fawney19/Aether main
+        required: true
+        type: string
+      request_id:
+        description: Unique ID used by the caller to locate this run
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: upstream-main-${{ inputs.upstream_sha }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/yabokun/aether
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  build:
+    name: Build and publish linux/amd64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate upstream commit
+        env:
+          UPSTREAM_SHA: ${{ inputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          [[ "${UPSTREAM_SHA}" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Check out upstream source
+        uses: actions/checkout@v5
+        with:
+          repository: fawney19/Aether
+          ref: ${{ inputs.upstream_sha }}
+          persist-credentials: false
+
+      - name: Verify checked out commit
+        env:
+          UPSTREAM_SHA: ${{ inputs.upstream_sha }}
+        run: test "$(git rev-parse HEAD)" = "${UPSTREAM_SHA}"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: upstream-main-${{ env.TARGET }}
+          workspaces: . -> target
+
+      - name: Install cross
+        uses: taiki-e/install-action@cross
+
+      - name: Build gateway
+        env:
+          AETHER_VERSION: main-${{ inputs.upstream_sha }}
+          AETHER_BUILD_TYPE: release
+          CARGO_TERM_COLOR: always
+        run: cross build --release --locked -p aether-gateway --target "${TARGET}"
+
+      - name: Prepare image context
+        run: |
+          set -euo pipefail
+          mkdir -p dist/frontend
+          install -m 0755 "target/${TARGET}/release/aether-gateway" dist/aether-gateway-amd64
+          cp -R frontend/dist/. dist/frontend/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.app
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:main-${{ inputs.upstream_sha }}
+            ${{ env.IMAGE }}:main
+          labels: |
+            org.opencontainers.image.source=https://github.com/fawney19/Aether
+            org.opencontainers.image.revision=${{ inputs.upstream_sha }}
+            org.opencontainers.image.version=main-${{ inputs.upstream_sha }}
+
+      - name: Verify published architecture
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull --platform linux/amd64 "${IMAGE}@${DIGEST}"
+          architecture=$(docker image inspect "${IMAGE}@${DIGEST}" --format '{{.Architecture}}/{{.Os}}')
+          [[ "${architecture}" == amd64/linux ]]
+
+      - name: Write build result
+        env:
+          UPSTREAM_SHA: ${{ inputs.upstream_sha }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          printf 'UPSTREAM_SHA=%s\nIMAGE=%s\nDIGEST=%s\nIMAGE_REF=%s@%s\nPLATFORM=linux/amd64\n' \
+            "${UPSTREAM_SHA}" "${IMAGE}" "${DIGEST}" "${IMAGE}" "${DIGEST}" > build-result.env
+          cat build-result.env >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload build result
+        uses: actions/upload-artifact@v5
+        with:
+          name: build-result
+          path: build-result.env
+          if-no-files-found: error
+          retention-days: 30
